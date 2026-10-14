@@ -5,26 +5,27 @@ Turns books (PDF, EPUB, DOCX, HTML, TXT, Markdown) into clean, chapter-split JSO
 
 - Finds chapters from the book's own table of contents, falling back to headings, then even chunks
 - PDF cleanup: strips running headers/footers and page numbers, rejoins hyphenated words, merges paragraphs split across pages
-- OCRs scanned PDFs automatically (needs `brew install tesseract`)
+- OCRs scanned PDFs automatically: Apple Vision on macOS (via `ocrmac`), or tesseract elsewhere
+- Handles rotated pages and two-page scanned spreads (reads left page, then right)
 - Removes Project Gutenberg boilerplate
 
 ## Setup
 
 ```bash
-pip3 install -r requirements.txt   # PyMuPDF, only needed for PDFs
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # PyMuPDF (+ macOS OCR)
 ```
 
 ## Use
 
 ```bash
 # drop files in ./books, then:
-python3 book_converter.py                                   # → ./library
-python3 book_converter.py --out ../book-reader/public/library   # straight into the reader
-python3 book_converter.py books/x.pdf --title "Title" --author "Name"
-python3 book_converter.py books/x.pdf --split words:3000    # no usable chapters? cut evenly
-python3 book_converter.py books/scan.pdf --ocr always --lang eng+ara
-python3 book_converter.py --list --out ../book-reader/public/library
-python3 book_converter.py --remove <book-id> --out ../book-reader/public/library
+.venv/bin/python book_converter.py                                   # → ./library
+.venv/bin/python book_converter.py --out ../book-reader/public/library   # straight into the reader
+.venv/bin/python book_converter.py books/x.pdf --title "Title" --author "Name"
+.venv/bin/python book_converter.py books/x.pdf --split words:3000    # no usable chapters? cut evenly
+.venv/bin/python book_converter.py books/scan.pdf --ocr always --lang eng+ara
+.venv/bin/python book_converter.py --list --out ../book-reader/public/library
+.venv/bin/python book_converter.py --remove <book-id> --out ../book-reader/public/library
 ```
 
 Then commit and push `book-reader` — Netlify redeploys with the new book.

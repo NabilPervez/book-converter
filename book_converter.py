@@ -557,9 +557,40 @@ ocr = "auto"        # auto | always | never   (set from --ocr)
 ocr_lang = "eng"
 
 
+def mac_ocr_available() -> bool:
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ocrmac.ocrmac  # noqa: F401  (Apple Vision via pyobjc)
+        return True
+    except ImportError:
+        return False
+
+
+def mac_ocr_lines(page, pno, fitz) -> list[dict]:
+    """OCR one page with Apple Vision; returns line dicts like the text-layer path."""
+    import io
+    from ocrmac import ocrmac
+    from PIL import Image
+    height, width = page.rect.height, page.rect.width
+    img = Image.open(io.BytesIO(page.get_pixmap(dpi=250).tobytes("png")))
+    langs = {"eng": "en-US", "ara": "ar-SA", "fra": "fr-FR", "deu": "de-DE", "spa": "es-ES"}
+    lang = [langs.get(l, l) for l in ocr_lang.split("+")]
+    out = []
+    for text, conf, (x, y, w, h) in ocrmac.OCR(img, recognition_level="accurate", language_preference=lang).recognize():
+        text = clean(text)
+        if not text:
+            continue
+        # Vision boxes are normalised with the origin at the bottom-left
+        out.append({"text": text, "size": round(h * height * 0.8, 1), "bold": False,
+                    "x0": x * width, "x1": (x + w) * width, "y0": (1 - y - h) * height, "y1": (1 - y) * height,
+                    "page": pno + 1, "h": height, "w": width})
+    return out
+
+
 def import_pdf(path: Path, split: str) -> Book:
     try:
-        import fitz  # PyMuPDF
+        import pymupdf as fitz
     except ImportError:
         sys.exit("PDF support needs PyMuPDF:  pip3 install pymupdf")
 
@@ -572,12 +603,15 @@ def import_pdf(path: Path, split: str) -> Book:
     sample = "".join(doc[i].get_text() for i in range(0, n_pages, max(1, n_pages // 25)))
     use_ocr = ocr == "always" or (ocr == "auto" and text_quality(sample) < 0.75)
     if use_ocr:
-        if not shutil.which("tesseract"):
-            print("  ! This PDF looks scanned (little or unreadable text). Install OCR and re-run:")
-            print("      brew install tesseract")
-            use_ocr = False
+        if mac_ocr_available():
+            use_ocr = "mac"
+            print(f"  scanned PDF — running macOS Vision OCR on {n_pages} pages…")
+        elif shutil.which("tesseract"):
+            print(f"  scanned PDF — running tesseract OCR on {n_pages} pages (this takes a while)…")
         else:
-            print(f"  scanned PDF — running OCR on {n_pages} pages (this takes a while)…")
+            print("  ! This PDF looks scanned (little or unreadable text). Install OCR and re-run:")
+            print("      pip install ocrmac   (macOS)   or   brew install tesseract")
+            use_ocr = False
 
     # 1. Lines with their font size / position
     pages = []   # per page: list of line dicts
@@ -586,15 +620,23 @@ def import_pdf(path: Path, split: str) -> Book:
         height, width = page.rect.height, page.rect.width
         lines = []
         tp = None
-        if use_ocr:
-            tp = page.get_textpage_ocr(flags=fitz.TEXT_PRESERVE_WHITESPACE, language=ocr_lang, dpi=300, full=True)
-            if (pno + 1) % 25 == 0:
-                print(f"    OCR {pno + 1}/{n_pages}")
-        for blk in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE, textpage=tp)["blocks"]:
+        if use_ocr and (pno + 1) % 25 == 0:
+            print(f"    OCR {pno + 1}/{n_pages}")
+        if use_ocr == "mac":
+            lines = mac_ocr_lines(page, pno, fitz)
+            raw_blocks = []
+        else:
+            if use_ocr:
+                tp = page.get_textpage_ocr(flags=fitz.TEXT_PRESERVE_WHITESPACE, language=ocr_lang, dpi=300, full=True)
+            raw_blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE, textpage=tp)["blocks"]
+        for blk in raw_blocks:
             if blk.get("type") != 0:
                 continue
             for ln in blk["lines"]:
-                if abs(ln.get("dir", (1, 0))[1]) > 0.1:   # rotated text (margins, watermarks)
+                # coordinates are in the unrotated page; map them to how the page is displayed
+                dx, dy = ln.get("dir", (1, 0))
+                vis = fitz.Point(dx, dy) * fitz.Matrix(page.rotation)
+                if abs(vis.y) > 0.1 or vis.x < 0:     # sideways text (margins, watermarks)
                     continue
                 spans = [s for s in ln["spans"] if s["text"].strip()]
                 if not spans:
@@ -612,9 +654,24 @@ def import_pdf(path: Path, split: str) -> Book:
                     continue
                 size = max(spans, key=lambda s: len(s["text"]))["size"]
                 bold = all((s["flags"] & 16) or "bold" in s["font"].lower() for s in spans)
-                x0, y0, x1, y1 = ln["bbox"]
+                x0, y0, x1, y1 = fitz.Rect(ln["bbox"]) * page.rotation_matrix
                 lines.append({"text": text, "size": round(size, 1), "bold": bold, "x0": x0, "x1": x1,
                               "y0": y0, "y1": y1, "page": pno + 1, "h": height, "w": width})
+        if width > height * 1.15 and lines:
+            # a two-page spread: read the left page, then the right, each as its own page
+            mid = width / 2
+            left = [l for l in lines if (l["x0"] + l["x1"]) / 2 < mid]
+            right = [l for l in lines if (l["x0"] + l["x1"]) / 2 >= mid]
+            for l in right:
+                l["x0"] -= mid
+                l["x1"] -= mid
+            for side, half in enumerate((left, right)):
+                for l in half:
+                    l["w"] = mid
+                    l["page"] = pno * 2 + side + 1   # printed-page order across spreads
+                half.sort(key=lambda l: (round(l["y0"] / 3), l["x0"]))
+                pages.append(half)
+            continue
         lines.sort(key=lambda l: (round(l["y0"] / 3), l["x0"]))
         pages.append(lines)
 

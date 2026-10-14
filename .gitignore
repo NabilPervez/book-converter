@@ -3,3 +3,4 @@ books/*
 library/
 __pycache__/
 .DS_Store
+.venv/
