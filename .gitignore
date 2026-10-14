@@ -1,0 +1,5 @@
+books/*
+!books/.gitkeep
+library/
+__pycache__/
+.DS_Store
