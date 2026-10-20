@@ -4,3 +4,4 @@ library/
 __pycache__/
 .DS_Store
 .venv/
+_out/

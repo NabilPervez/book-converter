@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import statistics
@@ -99,7 +100,7 @@ def title_case_if_shouting(s: str) -> str:
 
 
 CHAPTER_RE = re.compile(
-    r"^(chapter|part|book|section|prologue|epilogue|introduction|preface|foreword|afterword|conclusion|appendix)\b"
+    r"^(chapter|part|book|section|prologue|epilogue|introduction|preface|foreword|afterword|conclusion|appendix|juz)\b"
     r"|^(\d{1,3}|[ivxlc]{1,7})[.:)]?\s+[A-Z]",
     re.I,
 )
@@ -567,6 +568,44 @@ def mac_ocr_available() -> bool:
         return False
 
 
+_rapid = None
+
+
+def rapid_ocr_available() -> bool:
+    """RapidOCR (onnxruntime) fallback for Windows/Linux. Extra libs dir may be given via BOOK_OCR_LIBS."""
+    global _rapid
+    if _rapid is not None:
+        return bool(_rapid)
+    extra = os.environ.get("BOOK_OCR_LIBS")
+    if extra and extra not in sys.path:
+        sys.path.insert(0, extra)
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        _rapid = RapidOCR()
+    except Exception:
+        _rapid = False
+    return bool(_rapid)
+
+
+def rapid_ocr_lines(page, pno) -> list[dict]:
+    dpi = 220
+    k = 72 / dpi
+    height, width = page.rect.height, page.rect.width
+    res, _ = _rapid(page.get_pixmap(dpi=dpi).tobytes("png"))
+    out = []
+    for box, text, conf in (res or []):
+        text = clean(text)
+        if not text:
+            continue
+        xs = [p[0] * k for p in box]
+        ys = [p[1] * k for p in box]
+        h = max(ys) - min(ys)
+        out.append({"text": text, "size": round(h * 0.8, 1), "bold": False,
+                    "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+                    "page": pno + 1, "h": height, "w": width})
+    return out
+
+
 def mac_ocr_lines(page, pno, fitz) -> list[dict]:
     """OCR one page with Apple Vision; returns line dicts like the text-layer path."""
     import io
@@ -588,6 +627,43 @@ def mac_ocr_lines(page, pno, fitz) -> list[dict]:
     return out
 
 
+def order_columns(lines: list[dict], width: float) -> list[dict]:
+    """Reading order for a page set in two text columns: left column first, then right.
+    Lines that span the gutter (titles, full-width quotes) split the page into bands.
+    Pages without a clear gutter are returned unchanged (already sorted top-to-bottom)."""
+    if len(lines) < 12:
+        return lines
+    best = None
+    for i in range(35, 66):
+        gx = width * i / 100
+        cross = sum(1 for l in lines if l["x0"] < gx - 2 and l["x1"] > gx + 2)
+        left = sum(1 for l in lines if l["x1"] <= gx + 2)
+        right = sum(1 for l in lines if l["x0"] >= gx - 2)
+        if left >= 6 and right >= 6 and cross <= 0.2 * len(lines) and (best is None or cross < best[0]):
+            best = (cross, gx)
+    if not best:
+        return lines
+    gx = best[1]
+    out, left, right = [], [], []
+
+    def flush():
+        out.extend(left)
+        out.extend(right)
+        left.clear()
+        right.clear()
+
+    for l in lines:     # already sorted top-to-bottom
+        if l["x0"] < gx - 2 and l["x1"] > gx + 2:
+            flush()
+            out.append(l)
+        elif l["x1"] <= gx + 2:
+            left.append(l)
+        else:
+            right.append(l)
+    flush()
+    return out
+
+
 def import_pdf(path: Path, split: str) -> Book:
     try:
         import pymupdf as fitz
@@ -606,6 +682,9 @@ def import_pdf(path: Path, split: str) -> Book:
         if mac_ocr_available():
             use_ocr = "mac"
             print(f"  scanned PDF — running macOS Vision OCR on {n_pages} pages…")
+        elif rapid_ocr_available():
+            use_ocr = "rapid"
+            print(f"  scanned PDF — running RapidOCR on {n_pages} pages (this takes a while)…")
         elif shutil.which("tesseract"):
             print(f"  scanned PDF — running tesseract OCR on {n_pages} pages (this takes a while)…")
         else:
@@ -620,10 +699,13 @@ def import_pdf(path: Path, split: str) -> Book:
         height, width = page.rect.height, page.rect.width
         lines = []
         tp = None
-        if use_ocr and (pno + 1) % 25 == 0:
+        if use_ocr and (pno + 1) % 10 == 0:
             print(f"    OCR {pno + 1}/{n_pages}")
         if use_ocr == "mac":
             lines = mac_ocr_lines(page, pno, fitz)
+            raw_blocks = []
+        elif use_ocr == "rapid":
+            lines = rapid_ocr_lines(page, pno)
             raw_blocks = []
         else:
             if use_ocr:
@@ -650,6 +732,11 @@ def import_pdf(path: Path, split: str) -> Book:
                         t = f"{lead}*{core}*{trail}"
                     text += t
                 text = clean(text).replace("* *", " ")
+                if "�" in text:   # glyphs with no Unicode mapping (curly quotes/apostrophes/dashes)
+                    text = re.sub(r"(?<=[A-Za-z])�(?=[A-Za-z])", "’", text)
+                    text = re.sub(r"(?<=\d)�(?=\d)", "–", text)
+                    text = re.sub(r"�(?=\w)", "“", text)
+                    text = text.replace("�", "”")
                 if not text:
                     continue
                 size = max(spans, key=lambda s: len(s["text"]))["size"]
@@ -673,22 +760,28 @@ def import_pdf(path: Path, split: str) -> Book:
                 pages.append(half)
             continue
         lines.sort(key=lambda l: (round(l["y0"] / 3), l["x0"]))
-        pages.append(lines)
+        pages.append(order_columns(lines, width))
 
     if not any(pages):
         return book
 
     # 2. Running headers / footers / page numbers
     edge = Counter()
-    for p in pages:
+    edge_pages = {}
+    for pi, p in enumerate(pages):
         seen = set()
         for l in p:
             if l["y0"] < l["h"] * 0.09 or l["y1"] > l["h"] * 0.91:
                 key = re.sub(r"\d+", "#", l["text"].lower()).strip()
                 if key not in seen:
                     edge[key] += 1
+                    edge_pages.setdefault(key, []).append(pi)
                     seen.add(key)
     repeat_limit = max(3, n_pages * 0.2)
+    # headers that change per section (e.g. "VOLUME 1 > BOOK 2: BELIEF") repeat on consecutive pages
+    for key, pl in edge_pages.items():
+        if edge[key] < repeat_limit and any(pl[i + 2] - pl[i] == 2 for i in range(len(pl) - 2)):
+            edge[key] = repeat_limit
 
     def is_furniture(l):
         if re.fullmatch(r"[\divxlcIVXLC\s.\-–—|/]*(page\s*\d+)?[\s.\-–—]*", l["text"], re.I) and len(l["text"]) < 12:
@@ -741,7 +834,10 @@ def import_pdf(path: Path, split: str) -> Book:
         text = l["text"]
         if lvl:
             if cur and cur["t"] == lvl and prev and prev["page"] == l["page"] and l["y0"] - prev["y1"] < l["size"]:
-                cur["text"] += " " + text      # heading wrapped over two lines
+                if cur["text"].endswith("-") and not cur["text"].endswith(" -") and text[:1].islower():
+                    cur["text"] = cur["text"][:-1] + text      # de-hyphenate
+                else:
+                    cur["text"] += " " + text      # heading wrapped over two lines
             else:
                 flush()
                 cur = {"t": lvl, "text": text, "page": l["page"], "size": l["size"]}
@@ -800,7 +896,19 @@ def import_pdf(path: Path, split: str) -> Book:
         level = min(by_level)
         if by_level[level] < 3 and len(by_level) > 1:
             level = sorted(by_level)[1]
+        # outline too coarse for a long book (e.g. 9 volumes of ~190 pages)? use the next level down
+        for deeper in sorted(l for l in by_level if l > level):
+            if len(doc) / by_level[level] > 80 and 3 <= by_level[deeper] <= 600:
+                level = deeper
+            else:
+                break
         chosen = [(clean(t), p) for lvl, t, p in toc if lvl == level and p >= 1 and clean(t)]
+        # Word/InDesign exports often leave hidden bookmarks ("_Hlk123", "_GoBack") in the outline
+        if sum(bool(re.fullmatch(r"_\w+", t)) for t, _ in chosen) > 0.3 * len(chosen):
+            chosen = []
+        # scanner/export bookmarks that are just per-page labels ("Image 0002", "Page 5", "Untitled")
+        if sum(bool(re.fullmatch(r"(?i)(image|img|page|scan|untitled|slide)[\s_-]*\d*", t)) for t, _ in chosen) > 0.5 * len(chosen):
+            chosen = []
     if len(chosen) >= 2:
         print(f"  using the PDF outline ({len(chosen)} chapters)")
         chosen.sort(key=lambda x: x[1])
@@ -820,7 +928,7 @@ def import_pdf(path: Path, split: str) -> Book:
             book.add(b)
     else:
         h1s = [b for b in blocks if b["t"] == "h1"]
-        pattern_hits = [b for b in blocks if b["t"] in ("h1", "h2") and CHAPTER_RE.match(b["text"])]
+        pattern_hits = [b for b in blocks if b["t"] in ("h1", "h2") and CHAPTER_RE.match(b["text"].replace("*", ""))]
         if len(pattern_hits) >= 3:
             starts = {id(b) for b in pattern_hits}
         elif len(h1s) >= 2:
@@ -832,10 +940,10 @@ def import_pdf(path: Path, split: str) -> Book:
         for b in blocks:
             if id(b) in starts:
                 book.start(title_case_if_shouting(b["text"]))
-                pending_title = b["text"] if re.fullmatch(r"(chapter|part)\s+\S+", b["text"], re.I) else None
+                pending_title = b["text"] if re.fullmatch(r"(chapter|part|\*?juz\*?)\s+\S+", b["text"], re.I) else None
                 continue
             if pending_title and b["t"] in ("h1", "h2") and not book.chapters[-1]["blocks"]:
-                book.chapters[-1]["title"] = f"{title_case_if_shouting(pending_title)}: {title_case_if_shouting(b['text'])}"
+                book.chapters[-1]["title"] = f"{title_case_if_shouting(pending_title)}: {title_case_if_shouting(b['text'])}".replace("*", "")
                 pending_title = None
                 continue
             pending_title = None
@@ -856,14 +964,14 @@ IMPORTERS = {
 # ── library ────────────────────────────────────────────────────────────────────
 def load_index() -> list[dict]:
     try:
-        return json.loads(INDEX.read_text())
+        return json.loads(INDEX.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
 
 def save_index(index: list[dict]):
     LIB_DIR.mkdir(parents=True, exist_ok=True)
-    INDEX.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n")
+    INDEX.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def file_hash(path: Path) -> str:
@@ -933,7 +1041,7 @@ def import_file(path: Path, split="auto", title=None, author=None) -> dict | Non
         n = sum(words(b["text"]) for b in ch["blocks"])
         total_words += n
         blocks = [{k: v for k, v in b.items() if k in ("t", "text", "n", "page")} for b in ch["blocks"]]
-        (out / f"{cid}.json").write_text(json.dumps({"id": cid, "title": ch["title"], "blocks": blocks}, ensure_ascii=False))
+        (out / f"{cid}.json").write_text(json.dumps({"id": cid, "title": ch["title"], "blocks": blocks}, ensure_ascii=False), encoding="utf-8")
         toc.append({"id": cid, "number": i, "title": ch["title"], "words": n})
 
     entry = {
@@ -947,7 +1055,7 @@ def import_file(path: Path, split="auto", title=None, author=None) -> dict | Non
         "words": total_words,
         "addedAt": existing.get("addedAt") if existing else datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    (out / "book.json").write_text(json.dumps({**entry, "toc": toc}, ensure_ascii=False, indent=1))
+    (out / "book.json").write_text(json.dumps({**entry, "toc": toc}, ensure_ascii=False, indent=1), encoding="utf-8")
     index = [b for b in index if b["id"] != book_id] + [entry]
     save_index(index)
     mins = round(total_words / 230)
@@ -970,6 +1078,9 @@ def remove_book(book_id: str):
 
 
 def main():
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="*", type=Path)
     ap.add_argument("--books", type=Path, default=Path("books"), help="folder to scan for books (default ./books)")
